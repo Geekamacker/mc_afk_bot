@@ -1,0 +1,17 @@
+services:
+  bedrock-afk-bot:
+    image: bedrock-afk-bot:latest
+    container_name: Bedrock-AFK-Bot
+    environment:
+      - BOT_HOST=192.168.50.8
+      - BOT_PORT=19132
+      - BOT_PROFILE_ID=sorterbot1
+      - BOT_AUTH_CACHE_DIR=/app/auth-cache
+      - BOT_KEEPALIVE_MS=240000
+      - BOT_RECONNECT_INITIAL_MS=5000
+      - BOT_RECONNECT_MAX_MS=60000
+      - BOT_CONNECT_TIMEOUT_MS=30000
+      - TZ=America/Chicago
+    volumes:
+      - /mnt/user/docker/bedrock-afk-bot/auth-cache:/app/auth-cache
+    restart: unless-stopped
