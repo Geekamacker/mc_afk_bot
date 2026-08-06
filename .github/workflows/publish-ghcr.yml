@@ -10,6 +10,10 @@ permissions:
   contents: read
   packages: write
 
+  schedule:
+    - cron: "17 5 * * *"
+      timezone: "America/Chicago"
+
 jobs:
   push:
     runs-on: ubuntu-latest
