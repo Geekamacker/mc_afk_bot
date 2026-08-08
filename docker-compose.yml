@@ -1,6 +1,6 @@
 services:
   bedrock-afk-bot:
-    image: bedrock-afk-bot:latest
+    image: ghcr.io/geekamacker/mc_afk_bot:latest
     container_name: Bedrock-AFK-Bot
     environment:
       - BOT_HOST=192.168.50.8
