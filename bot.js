@@ -11,12 +11,11 @@ const AUTH_CACHE_DIR = process.env.BOT_AUTH_CACHE_DIR || '/app/auth-cache'
 const KEEPALIVE_MS = parseIntegerEnv('BOT_KEEPALIVE_MS', 240000, 1000)
 const RECONNECT_INITIAL_MS = parseIntegerEnv('BOT_RECONNECT_INITIAL_MS', 5000, 1000)
 const RECONNECT_MAX_MS = parseIntegerEnv('BOT_RECONNECT_MAX_MS', 60000, RECONNECT_INITIAL_MS)
-const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 30000, 1000)
+const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 180000, 1000)
 
 let client = null
 let keepaliveTimer = null
 let reconnectTimer = null
-let connectTimeoutTimer = null
 
 let entityId = null
 let lastPos = { x: 0, y: 64, z: 0 }
@@ -28,6 +27,7 @@ let intentionallyStopping = false
 let connecting = false
 let connected = false
 let sessionClosing = false
+let activeDeviceCode = null
 
 function parseIntegerEnv(name, fallback, minimum) {
   const raw = process.env[name]
@@ -54,11 +54,6 @@ function clearConnectionTimers() {
     clearInterval(keepaliveTimer)
     keepaliveTimer = null
   }
-
-  if (connectTimeoutTimer) {
-    clearTimeout(connectTimeoutTimer)
-    connectTimeoutTimer = null
-  }
 }
 
 function clearReconnectTimer() {
@@ -78,6 +73,7 @@ function clearSessionState() {
   lastPos = { x: 0, y: 64, z: 0 }
   anchorPos = null
   movementTick = 0n
+  activeDeviceCode = null
   connected = false
   connecting = false
 }
@@ -201,6 +197,9 @@ function startKeepalive() {
 }
 
 function handleMsaCode(code) {
+  // A new code supersedes every older code shown in the logs.
+  activeDeviceCode = code?.user_code || null
+
   log('=== MICROSOFT SIGN-IN REQUIRED ===')
 
   if (code?.verification_uri_complete) {
@@ -209,18 +208,28 @@ function handleMsaCode(code) {
     log(`Open this link: ${code.verification_uri}`)
   }
 
-  if (code?.user_code) {
-    log(`Enter this code: ${code.user_code}`)
+  if (activeDeviceCode) {
+    log(`Enter this code: ${activeDeviceCode}`)
   }
 
-  log('Sign in with the Microsoft account you want this bot to use.')
+  if (Number.isFinite(code?.expires_in)) {
+    log(`This code expires in about ${Math.ceil(code.expires_in / 60)} minute(s).`)
+  }
+
+  log('Use only the newest code shown in the logs.')
+  log('Do not restart the bot while Microsoft sign-in is pending.')
   log('After successful sign-in, tokens will be cached for reuse.')
   log('=================================')
 }
 
 function attachClientHandlers(newClient) {
+  newClient.on('session', (profile) => {
+    activeDeviceCode = null
+    log(`Microsoft/Xbox authentication completed as ${profile?.name || 'unknown player'}`)
+  })
+
   newClient.on('login', () => {
-    log('Authenticated successfully')
+    log('Server login handshake completed')
   })
 
   newClient.on('join', () => {
@@ -232,11 +241,6 @@ function attachClientHandlers(newClient) {
 
     clearReconnectTimer()
     resetReconnectBackoff()
-
-    if (connectTimeoutTimer) {
-      clearTimeout(connectTimeoutTimer)
-      connectTimeoutTimer = null
-    }
   })
 
   newClient.on('start_game', (packet) => {
@@ -294,7 +298,14 @@ function attachClientHandlers(newClient) {
 
   newClient.on('error', (err) => {
     log('Error:', err?.stack || err?.message || err)
-    finishSession('client-error')
+
+    // Before join, errors such as failed authentication or ping failure leave
+    // no usable session, so reconnect. Once joined, bedrock-protocol documents
+    // error events as potentially recoverable; wait for close/kick instead of
+    // tearing down a healthy connection for every parser or transport warning.
+    if (!connected) {
+      finishSession('client-error')
+    }
   })
 
   // "close" is the documented terminal event. "end" is retained for
@@ -328,7 +339,8 @@ async function startBot() {
   log(`Connecting to ${HOST}:${PORT} with Microsoft/Xbox authentication`)
   log(`Using auth cache: ${AUTH_CACHE_DIR}`)
   log(`Using local auth profile ID: ${PROFILE_ID}`)
-  log(`Connection/authentication timeout: ${CONNECT_TIMEOUT_MS} ms`)
+  log(`Post-authentication network timeout: ${CONNECT_TIMEOUT_MS} ms`)
+  log('Microsoft device-code authentication is allowed to run until Microsoft expires the code.')
 
   try {
     const authFlow = new Authflow(
@@ -350,13 +362,6 @@ async function startBot() {
     })
 
     attachClientHandlers(client)
-
-    connectTimeoutTimer = setTimeout(() => {
-      if (!connected) {
-        log(`Connect/authentication timeout after ${CONNECT_TIMEOUT_MS} ms`)
-        finishSession('connect-timeout')
-      }
-    }, CONNECT_TIMEOUT_MS)
   } catch (err) {
     log('Startup failed:', err?.stack || err?.message || err)
     finishSession('startup-error')
