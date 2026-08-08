@@ -5,21 +5,20 @@ on:
     branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * *"
+      timezone: "America/Chicago"
 
 permissions:
   contents: read
   packages: write
-
-  schedule:
-    - cron: "17 5 * * *"
-      timezone: "America/Chicago"
 
 jobs:
   push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repo
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Log in to GHCR
