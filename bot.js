@@ -13,6 +13,11 @@ const RECONNECT_INITIAL_MS = parseIntegerEnv('BOT_RECONNECT_INITIAL_MS', 5000, 1
 const RECONNECT_MAX_MS = parseIntegerEnv('BOT_RECONNECT_MAX_MS', 60000, RECONNECT_INITIAL_MS)
 const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 180000, 1000)
 
+// Temporary compatibility workaround for bedrock-protocol issue #764.
+// Enabled by default for this build; set BOT_DISABLE_LATENCY_ECHO=false to
+// restore bedrock-protocol's automatic network_stack_latency responses.
+const DISABLE_LATENCY_ECHO = parseBooleanEnv('BOT_DISABLE_LATENCY_ECHO', true)
+
 let client = null
 let keepaliveTimer = null
 let reconnectTimer = null
@@ -28,6 +33,21 @@ let connecting = false
 let connected = false
 let sessionClosing = false
 let activeDeviceCode = null
+
+function parseBooleanEnv(name, fallback) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+
+  const normalized = String(raw).trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+
+  console.warn(
+    `${new Date().toISOString()} Invalid ${name}=${JSON.stringify(raw)}; ` +
+    `using ${fallback}`
+  )
+  return fallback
+}
 
 function parseIntegerEnv(name, fallback, minimum) {
   const raw = process.env[name]
@@ -250,6 +270,42 @@ function handleMsaCode(code) {
   log('=================================')
 }
 
+function installLatencyEchoWorkaround(newClient) {
+  if (!DISABLE_LATENCY_ECHO) {
+    log('Compatibility workaround disabled: automatic network_stack_latency responses remain enabled.')
+    return
+  }
+
+  // createClient() registers its own connect_allowed listener before returning.
+  // That upstream listener calls connect() and installs the automatic latency
+  // echo. Our listener is registered afterward, so it runs next and removes
+  // only the newly installed latency listeners while leaving any listener that
+  // already existed before this workaround was installed.
+  const preexistingListeners = new Set(
+    typeof newClient.rawListeners === 'function'
+      ? newClient.rawListeners('network_stack_latency')
+      : newClient.listeners('network_stack_latency')
+  )
+
+  newClient.once('connect_allowed', () => {
+    const currentListeners = typeof newClient.rawListeners === 'function'
+      ? newClient.rawListeners('network_stack_latency')
+      : newClient.listeners('network_stack_latency')
+
+    let removed = 0
+    for (const listener of currentListeners) {
+      if (preexistingListeners.has(listener)) continue
+      newClient.removeListener('network_stack_latency', listener)
+      removed += 1
+    }
+
+    log(
+      'Compatibility workaround enabled: disabled automatic ' +
+      `network_stack_latency responses; removed ${removed} listener(s).`
+    )
+  })
+}
+
 function attachClientHandlers(newClient) {
   // bedrock-protocol emits the generic `packet` event before it applies its
   // authentication-state filter. This lets us capture a packet-violation
@@ -416,6 +472,7 @@ async function startBot() {
   log(`Using auth cache: ${AUTH_CACHE_DIR}`)
   log(`Using local auth profile ID: ${PROFILE_ID}`)
   log(`Post-authentication network timeout: ${CONNECT_TIMEOUT_MS} ms`)
+  log(`Disable automatic latency echo workaround: ${DISABLE_LATENCY_ECHO}`)
   log('Microsoft device-code authentication is allowed to run until Microsoft expires the code.')
 
   try {
@@ -437,6 +494,7 @@ async function startBot() {
       connectTimeout: CONNECT_TIMEOUT_MS
     })
 
+    installLatencyEchoWorkaround(client)
     attachClientHandlers(client)
   } catch (err) {
     log('Startup failed:', err?.stack || err?.message || err)
