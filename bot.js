@@ -49,6 +49,26 @@ function log(...args) {
   console.log(new Date().toISOString(), ...args)
 }
 
+function safeJson(value) {
+  if (value === undefined) return '(undefined)'
+
+  try {
+    return JSON.stringify(value, (_key, item) => {
+      if (typeof item === 'bigint') return item.toString()
+      if (item instanceof Error) {
+        return {
+          name: item.name,
+          message: item.message,
+          stack: item.stack
+        }
+      }
+      return item
+    })
+  } catch (err) {
+    return `[unserializable: ${err?.message || err}]`
+  }
+}
+
 function clearConnectionTimers() {
   if (keepaliveTimer) {
     clearInterval(keepaliveTimer)
@@ -231,6 +251,10 @@ function handleMsaCode(code) {
 }
 
 function attachClientHandlers(newClient) {
+  newClient.on('connect', () => {
+    log('RakNet connection established')
+  })
+
   newClient.on('session', (profile) => {
     activeDeviceCode = null
     log(`Microsoft/Xbox authentication completed as ${profile?.name || 'unknown player'}`)
@@ -292,16 +316,26 @@ function attachClientHandlers(newClient) {
     }
   })
 
+  newClient.on('play_status', (packet) => {
+    log('PLAY STATUS:', safeJson(packet))
+  })
+
   newClient.on('text', (packet) => {
-    log(`[CHAT] ${packet?.source_name || 'server'}: ${packet?.message || ''}`)
+    const source = packet?.source_name || 'server'
+    const message = packet?.message || ''
+    const parameters = Array.isArray(packet?.parameters) && packet.parameters.length > 0
+      ? ` | parameters=${safeJson(packet.parameters)}`
+      : ''
+
+    log(`[CHAT] ${source}: ${message}${parameters}`)
   })
 
   newClient.on('disconnect', (packet) => {
-    log('Disconnected:', JSON.stringify(packet))
+    log('SERVER DISCONNECT PACKET:', safeJson(packet))
   })
 
   newClient.on('kick', (reason) => {
-    log('Kicked:', JSON.stringify(reason))
+    log('KICK EVENT:', safeJson(reason))
   })
 
   newClient.on('error', (err) => {
@@ -318,13 +352,15 @@ function attachClientHandlers(newClient) {
 
   // "close" is the documented terminal event. "end" is retained for
   // compatibility with older transports/releases. finishSession is idempotent.
-  newClient.on('end', () => {
-    log('Connection ended')
+  newClient.on('end', (...args) => {
+    const detail = args.length > 0 ? safeJson(args.length === 1 ? args[0] : args) : '(no reason supplied)'
+    log(`Connection ended. Detail: ${detail}`)
     finishSession('end')
   })
 
-  newClient.on('close', () => {
-    log('Connection closed')
+  newClient.on('close', (...args) => {
+    const detail = args.length > 0 ? safeJson(args.length === 1 ? args[0] : args) : '(no reason supplied)'
+    log(`Connection closed. Reason: ${detail}`)
     finishSession('close')
   })
 }
