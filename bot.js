@@ -11,7 +11,7 @@ const AUTH_CACHE_DIR = process.env.BOT_AUTH_CACHE_DIR || '/app/auth-cache'
 const KEEPALIVE_MS = parseIntegerEnv('BOT_KEEPALIVE_MS', 240000, 1000)
 const RECONNECT_INITIAL_MS = parseIntegerEnv('BOT_RECONNECT_INITIAL_MS', 5000, 1000)
 const RECONNECT_MAX_MS = parseIntegerEnv('BOT_RECONNECT_MAX_MS', 60000, RECONNECT_INITIAL_MS)
-const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 180000, 1000)
+const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 30000, 1000)
 
 let client = null
 let keepaliveTimer = null
