@@ -4,194 +4,137 @@ const bedrock = require('bedrock-protocol')
 const { Authflow, Titles } = require('prismarine-auth')
 
 const HOST = process.env.BOT_HOST || '127.0.0.1'
-const PORT = parseIntegerEnv('BOT_PORT', 19132, 1)
+const PORT = readInteger('BOT_PORT', 19132, 1)
 const PROFILE_ID = process.env.BOT_PROFILE_ID || 'sorterbot'
 const AUTH_CACHE_DIR = process.env.BOT_AUTH_CACHE_DIR || '/app/auth-cache'
 
-const KEEPALIVE_MS = parseIntegerEnv('BOT_KEEPALIVE_MS', 240000, 1000)
-const RECONNECT_INITIAL_MS = parseIntegerEnv('BOT_RECONNECT_INITIAL_MS', 5000, 1000)
-const RECONNECT_MAX_MS = parseIntegerEnv('BOT_RECONNECT_MAX_MS', 60000, RECONNECT_INITIAL_MS)
-const CONNECT_TIMEOUT_MS = parseIntegerEnv('BOT_CONNECT_TIMEOUT_MS', 180000, 1000)
-
-// Temporary compatibility workaround for bedrock-protocol issue #764.
-// Enabled by default for this build; set BOT_DISABLE_LATENCY_ECHO=false to
-// restore bedrock-protocol's automatic network_stack_latency responses.
-const DISABLE_LATENCY_ECHO = parseBooleanEnv('BOT_DISABLE_LATENCY_ECHO', true)
+const KEEPALIVE_MS = readInteger('BOT_KEEPALIVE_MS', 240000, 1000)
+const RECONNECT_INITIAL_MS = readInteger('BOT_RECONNECT_INITIAL_MS', 5000, 1000)
+const RECONNECT_MAX_MS = readInteger(
+  'BOT_RECONNECT_MAX_MS',
+  60000,
+  RECONNECT_INITIAL_MS
+)
+const CONNECT_TIMEOUT_MS = readInteger('BOT_CONNECT_TIMEOUT_MS', 30000, 1000)
 
 let client = null
 let keepaliveTimer = null
 let reconnectTimer = null
 
 let entityId = null
-let lastPos = { x: 0, y: 64, z: 0 }
-let anchorPos = null
+let anchorPosition = null
 let movementTick = 0n
 
-let reconnectDelay = RECONNECT_INITIAL_MS
-let intentionallyStopping = false
-let connecting = false
 let connected = false
-let sessionClosing = false
-let activeDeviceCode = null
-
-function parseBooleanEnv(name, fallback) {
-  const raw = process.env[name]
-  if (raw === undefined || raw === '') return fallback
-
-  const normalized = String(raw).trim().toLowerCase()
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
-
-  console.warn(
-    `${new Date().toISOString()} Invalid ${name}=${JSON.stringify(raw)}; ` +
-    `using ${fallback}`
-  )
-  return fallback
-}
-
-function parseIntegerEnv(name, fallback, minimum) {
-  const raw = process.env[name]
-  if (raw === undefined || raw === '') return fallback
-
-  const value = Number.parseInt(raw, 10)
-  if (!Number.isFinite(value) || value < minimum) {
-    console.warn(
-      `${new Date().toISOString()} Invalid ${name}=${JSON.stringify(raw)}; ` +
-      `using ${fallback}`
-    )
-    return fallback
-  }
-
-  return value
-}
+let connecting = false
+let endingSession = false
+let stopping = false
+let reconnectDelay = RECONNECT_INITIAL_MS
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
 }
 
-function safeJson(value) {
+function readInteger(name, fallback, minimum) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+
+  const value = Number.parseInt(raw, 10)
+  if (Number.isFinite(value) && value >= minimum) return value
+
+  log(`Invalid ${name}=${JSON.stringify(raw)}; using ${fallback}`)
+  return fallback
+}
+
+function toJson(value) {
   if (value === undefined) return '(undefined)'
 
   try {
-    return JSON.stringify(value, (_key, item) => {
-      if (typeof item === 'bigint') return item.toString()
-      if (item instanceof Error) {
-        return {
-          name: item.name,
-          message: item.message,
-          stack: item.stack
-        }
-      }
-      return item
-    })
-  } catch (err) {
-    return `[unserializable: ${err?.message || err}]`
+    return JSON.stringify(value, (_key, item) =>
+      typeof item === 'bigint' ? item.toString() : item
+    )
+  } catch (error) {
+    return `[unable to serialize: ${error.message}]`
   }
 }
 
-function clearConnectionTimers() {
-  if (keepaliveTimer) {
-    clearInterval(keepaliveTimer)
-    keepaliveTimer = null
-  }
+function clearKeepalive() {
+  if (!keepaliveTimer) return
+  clearInterval(keepaliveTimer)
+  keepaliveTimer = null
 }
 
-function clearReconnectTimer() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
+function clearReconnect() {
+  if (!reconnectTimer) return
+  clearTimeout(reconnectTimer)
+  reconnectTimer = null
 }
 
-function clearAllTimers() {
-  clearConnectionTimers()
-  clearReconnectTimer()
-}
-
-function clearSessionState() {
+function resetSessionState() {
   entityId = null
-  lastPos = { x: 0, y: 64, z: 0 }
-  anchorPos = null
+  anchorPosition = null
   movementTick = 0n
-  activeDeviceCode = null
   connected = false
   connecting = false
 }
 
-function safeCloseClient(reason = 'Client restarting') {
+function closeClient(reason = 'Client closing') {
   if (!client) return
 
-  const currentClient = client
+  const oldClient = client
   client = null
 
-  // Remove our handlers first so an intentional close cannot schedule another
-  // reconnect through a late close/end event.
   try {
-    currentClient.removeAllListeners()
-
-    // Authentication or ping work may still finish after we detach this client.
-    // Keep a harmless error listener so a late error event cannot terminate Node.
-    currentClient.on('error', (err) => {
-      log('Ignored late client error:', err?.message || err)
+    oldClient.removeAllListeners()
+    oldClient.on('error', (error) => {
+      log('Ignored late client error:', error?.message || error)
     })
   } catch (_) {}
 
   try {
-    // Avoid forcing the native RakNet transport closed before it has actually
-    // connected. Current bedrock-protocol versions can be unsafe in that state.
-    if (currentClient.connection?.connected === true) {
-      if (typeof currentClient.disconnect === 'function') {
-        currentClient.disconnect(reason, true)
-      } else if (typeof currentClient.close === 'function') {
-        currentClient.close()
-      }
+    if (oldClient.connection?.connected !== true) return
+
+    if (typeof oldClient.disconnect === 'function') {
+      oldClient.disconnect(reason, true)
+    } else if (typeof oldClient.close === 'function') {
+      oldClient.close()
     }
-  } catch (err) {
-    log('Client close warning:', err.message)
+  } catch (error) {
+    log('Client close warning:', error.message)
   }
 }
 
-function scheduleReconnect(reason = 'unknown') {
-  if (intentionallyStopping || reconnectTimer) return
+function scheduleReconnect(reason) {
+  if (stopping || reconnectTimer) return
 
   const delay = reconnectDelay
   log(`Reconnect scheduled in ${delay} ms (reason: ${reason})`)
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
-    startBot().catch((err) => {
-      log('Reconnect attempt failed:', err?.stack || err?.message || err)
-      finishSession('reconnect-attempt-error')
+    startBot().catch((error) => {
+      log('Reconnect failed:', error?.stack || error?.message || error)
+      finishSession('reconnect-error')
     })
   }, delay)
 
   reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS)
 }
 
-function resetReconnectBackoff() {
-  reconnectDelay = RECONNECT_INITIAL_MS
-}
-
 function finishSession(reason) {
-  if (intentionallyStopping || sessionClosing) return
+  if (stopping || endingSession) return
 
-  sessionClosing = true
+  endingSession = true
   log(`Finishing session (reason: ${reason})`)
 
-  clearConnectionTimers()
-  clearSessionState()
-  safeCloseClient(`Session ended: ${reason}`)
+  clearKeepalive()
+  resetSessionState()
+  closeClient(`Session ended: ${reason}`)
   scheduleReconnect(reason)
 }
 
-function sameEntityId(left, right) {
-  return left !== null && left !== undefined &&
-    right !== null && right !== undefined &&
-    String(left) === String(right)
-}
-
-function queueKeepaliveMove(position) {
-  if (!client || entityId === null || !connected) return
+function sendKeepalive(position) {
+  if (!client || !connected || entityId === null) return
 
   movementTick += 1n
 
@@ -211,24 +154,28 @@ function queueKeepaliveMove(position) {
 }
 
 function startKeepalive() {
-  if (keepaliveTimer) clearInterval(keepaliveTimer)
+  clearKeepalive()
 
-  let movedOffAnchor = false
+  let moved = false
 
   keepaliveTimer = setInterval(() => {
+    if (!client || !connected || entityId === null || !anchorPosition) return
+
     try {
-      if (!client || entityId === null || !connected || !anchorPos) return
+      moved = !moved
 
-      movedOffAnchor = !movedOffAnchor
+      const position = moved
+        ? {
+            x: anchorPosition.x + 0.03,
+            y: anchorPosition.y,
+            z: anchorPosition.z
+          }
+        : { ...anchorPosition }
 
-      const position = movedOffAnchor
-        ? { x: anchorPos.x + 0.03, y: anchorPos.y, z: anchorPos.z }
-        : { ...anchorPos }
-
-      queueKeepaliveMove(position)
-      log(movedOffAnchor ? 'Moved slightly off anchor' : 'Returned to anchor')
-    } catch (err) {
-      log('Keepalive send failed:', err?.stack || err?.message || err)
+      sendKeepalive(position)
+      log(moved ? 'Moved slightly off anchor' : 'Returned to anchor')
+    } catch (error) {
+      log('Keepalive failed:', error?.stack || error?.message || error)
       finishSession('keepalive-error')
     }
   }, KEEPALIVE_MS)
@@ -236,154 +183,74 @@ function startKeepalive() {
   log(`Keepalive enabled every ${KEEPALIVE_MS} ms`)
 }
 
-function handleMsaCode(code) {
-  // A new code supersedes every older code shown in the logs.
-  activeDeviceCode = code?.user_code || null
-
+function showMicrosoftCode(code) {
+  const userCode = code?.user_code || null
   const verificationUri = code?.verification_uri || 'https://www.microsoft.com/link'
   let signInUrl = verificationUri
 
-  if (activeDeviceCode) {
+  if (userCode) {
     try {
       const url = new URL(verificationUri)
-      url.searchParams.set('otc', activeDeviceCode)
+      url.searchParams.set('otc', userCode)
       signInUrl = url.toString()
     } catch (_) {
-      signInUrl = `https://www.microsoft.com/link?otc=${encodeURIComponent(activeDeviceCode)}`
+      signInUrl = `https://www.microsoft.com/link?otc=${encodeURIComponent(userCode)}`
     }
   }
 
   log('=== MICROSOFT SIGN-IN REQUIRED ===')
   log(`COPY/OPEN THIS LINK: ${signInUrl}`)
 
-  if (activeDeviceCode) {
-    log(`Fallback code: ${activeDeviceCode}`)
-  }
+  if (userCode) log(`Fallback code: ${userCode}`)
 
   if (Number.isFinite(code?.expires_in)) {
     log(`This code expires in about ${Math.ceil(code.expires_in / 60)} minute(s).`)
   }
 
-  log('Use only the newest COPY/OPEN THIS LINK shown in the logs.')
-  log('Do not restart the bot while Microsoft sign-in is pending.')
-  log('After successful sign-in, tokens will be cached for reuse.')
+  log('Do not restart the bot while sign-in is pending.')
   log('=================================')
 }
 
-function installLatencyEchoWorkaround(newClient) {
-  if (!DISABLE_LATENCY_ECHO) {
-    log('Compatibility workaround disabled: automatic network_stack_latency responses remain enabled.')
-    return
-  }
-
-  // createClient() registers its own connect_allowed listener before returning.
-  // That upstream listener calls connect() and installs the automatic latency
-  // echo. Our listener is registered afterward, so it runs next and removes
-  // only the newly installed latency listeners while leaving any listener that
-  // already existed before this workaround was installed.
-  const preexistingListeners = new Set(
-    typeof newClient.rawListeners === 'function'
-      ? newClient.rawListeners('network_stack_latency')
-      : newClient.listeners('network_stack_latency')
-  )
-
-  newClient.once('connect_allowed', () => {
-    const currentListeners = typeof newClient.rawListeners === 'function'
-      ? newClient.rawListeners('network_stack_latency')
-      : newClient.listeners('network_stack_latency')
-
-    let removed = 0
-    for (const listener of currentListeners) {
-      if (preexistingListeners.has(listener)) continue
-      newClient.removeListener('network_stack_latency', listener)
-      removed += 1
-    }
-
-    log(
-      'Compatibility workaround enabled: disabled automatic ' +
-      `network_stack_latency responses; removed ${removed} listener(s).`
-    )
-  })
-}
-
 function attachClientHandlers(newClient) {
-  // bedrock-protocol emits the generic `packet` event before it applies its
-  // authentication-state filter. This lets us capture a packet-violation
-  // warning that would otherwise be discarded before the named event fires.
-  newClient.on('packet', (deserialized) => {
-    const packetName = deserialized?.data?.name
-    const packetParams = deserialized?.data?.params
-
-    if (packetName === 'packet_violation_warning') {
-      log('PACKET VIOLATION WARNING:', safeJson(packetParams))
-      return
-    }
-
-    // These are useful during the login sequence and do not contain the huge
-    // authentication/skin payload sent by the client.
-    if (packetName === 'disconnect') {
-      log('RAW DISCONNECT PACKET:', safeJson(packetParams))
-    } else if (packetName === 'play_status') {
-      log('RAW PLAY STATUS:', safeJson(packetParams))
-    }
-  })
-
-  newClient.on('status', (status) => {
-    const names = {
-      0: 'Disconnected',
-      1: 'Connecting',
-      2: 'Authenticating',
-      3: 'Initializing',
-      4: 'Initialized'
-    }
-    log(`CLIENT STATUS: ${status} (${names[status] || 'Unknown'})`)
-  })
-
-  newClient.on('connect', () => {
-    log('RakNet connection established')
+  // This is the one targeted diagnostic worth retaining. bedrock-protocol
+  // exposes the packet here before rejecting it during authentication.
+  newClient.on('packet', (packet) => {
+    if (packet?.data?.name !== 'packet_violation_warning') return
+    log('PACKET VIOLATION WARNING:', toJson(packet.data.params))
   })
 
   newClient.on('session', (profile) => {
-    activeDeviceCode = null
     log(`Microsoft/Xbox authentication completed as ${profile?.name || 'unknown player'}`)
   })
 
-  newClient.on('login', () => {
-    log('Server login handshake completed')
-  })
-
   newClient.on('join', () => {
-    log('Joined server')
-
     connected = true
     connecting = false
-    sessionClosing = false
-
-    clearReconnectTimer()
-    resetReconnectBackoff()
+    endingSession = false
+    reconnectDelay = RECONNECT_INITIAL_MS
+    clearReconnect()
+    log('Joined server')
   })
 
   newClient.on('start_game', (packet) => {
-    if (packet?.runtime_entity_id !== null && packet?.runtime_entity_id !== undefined) {
-      entityId = packet.runtime_entity_id
-      log(`Runtime entity ID set to ${String(entityId)}`)
-    } else if (newClient.entityId !== null && newClient.entityId !== undefined) {
-      entityId = newClient.entityId
+    entityId = packet?.runtime_entity_id ?? newClient.entityId ?? null
+
+    if (entityId !== null) {
       log(`Runtime entity ID set to ${String(entityId)}`)
     }
 
     if (packet?.player_position) {
-      lastPos = {
+      anchorPosition = {
         x: packet.player_position.x,
         y: packet.player_position.y,
         z: packet.player_position.z
       }
 
-      anchorPos = { ...lastPos }
-      log(`Anchor position set to ${anchorPos.x}, ${anchorPos.y}, ${anchorPos.z}`)
+      log(
+        `Anchor position set to ${anchorPosition.x}, ` +
+        `${anchorPosition.y}, ${anchorPosition.z}`
+      )
     }
-
-    log('Received start_game')
   })
 
   newClient.on('spawn', () => {
@@ -391,89 +258,60 @@ function attachClientHandlers(newClient) {
     startKeepalive()
   })
 
-  // Only accept movement updates that belong to this bot. The old version
-  // could accidentally replace entityId with another player or mob's ID.
-  newClient.on('move_player', (packet) => {
-    if (!sameEntityId(packet?.runtime_entity_id, entityId)) return
-    if (!packet?.position) return
-
-    lastPos = {
-      x: packet.position.x,
-      y: packet.position.y,
-      z: packet.position.z
-    }
-  })
-
-  newClient.on('play_status', (packet) => {
-    log('PLAY STATUS:', safeJson(packet))
-  })
-
   newClient.on('text', (packet) => {
     const source = packet?.source_name || 'server'
     const message = packet?.message || ''
-    const parameters = Array.isArray(packet?.parameters) && packet.parameters.length > 0
-      ? ` | parameters=${safeJson(packet.parameters)}`
+    const parameters = Array.isArray(packet?.parameters) && packet.parameters.length
+      ? ` | parameters=${toJson(packet.parameters)}`
       : ''
 
     log(`[CHAT] ${source}: ${message}${parameters}`)
   })
 
   newClient.on('disconnect', (packet) => {
-    log('SERVER DISCONNECT PACKET:', safeJson(packet))
+    log('Server disconnect:', toJson(packet))
   })
 
   newClient.on('kick', (reason) => {
-    log('KICK EVENT:', safeJson(reason))
+    log('Kicked:', toJson(reason))
   })
 
-  newClient.on('error', (err) => {
-    log('Error:', err?.stack || err?.message || err)
-
-    // Before join, errors such as failed authentication or ping failure leave
-    // no usable session, so reconnect. Once joined, bedrock-protocol documents
-    // error events as potentially recoverable; wait for close/kick instead of
-    // tearing down a healthy connection for every parser or transport warning.
-    if (!connected) {
-      finishSession('client-error')
-    }
+  newClient.on('error', (error) => {
+    log('Client error:', error?.stack || error?.message || error)
+    if (!connected) finishSession('client-error')
   })
 
-  // "close" is the documented terminal event. "end" is retained for
-  // compatibility with older transports/releases. finishSession is idempotent.
-  newClient.on('end', (...args) => {
-    const detail = args.length > 0 ? safeJson(args.length === 1 ? args[0] : args) : '(no reason supplied)'
-    log(`Connection ended. Detail: ${detail}`)
+  newClient.on('end', () => {
+    log('Connection ended')
     finishSession('end')
   })
 
-  newClient.on('close', (...args) => {
-    const detail = args.length > 0 ? safeJson(args.length === 1 ? args[0] : args) : '(no reason supplied)'
-    log(`Connection closed. Reason: ${detail}`)
+  newClient.on('close', () => {
+    log('Connection closed')
     finishSession('close')
   })
 }
 
 async function startBot() {
-  if (intentionallyStopping) return
+  if (stopping) return
 
   if (connecting || connected) {
-    log('Connect attempt skipped because a session is already active')
+    log('Connect skipped because a session is already active')
     return
   }
 
-  clearAllTimers()
-  safeCloseClient()
-  clearSessionState()
+  clearReconnect()
+  clearKeepalive()
+  closeClient()
+  resetSessionState()
 
   connecting = true
-  sessionClosing = false
+  endingSession = false
 
   log(`Connecting to ${HOST}:${PORT} with Microsoft/Xbox authentication`)
   log(`Using auth cache: ${AUTH_CACHE_DIR}`)
   log(`Using local auth profile ID: ${PROFILE_ID}`)
   log(`Post-authentication network timeout: ${CONNECT_TIMEOUT_MS} ms`)
-  log(`Disable automatic latency echo workaround: ${DISABLE_LATENCY_ECHO}`)
-  log('Microsoft device-code authentication is allowed to run until Microsoft expires the code.')
 
   try {
     const authFlow = new Authflow(
@@ -484,7 +322,7 @@ async function startBot() {
         authTitle: Titles.MinecraftNintendoSwitch,
         deviceType: 'Nintendo'
       },
-      handleMsaCode
+      showMicrosoftCode
     )
 
     client = bedrock.createClient({
@@ -494,31 +332,30 @@ async function startBot() {
       connectTimeout: CONNECT_TIMEOUT_MS
     })
 
-    installLatencyEchoWorkaround(client)
     attachClientHandlers(client)
-  } catch (err) {
-    log('Startup failed:', err?.stack || err?.message || err)
+  } catch (error) {
+    log('Startup failed:', error?.stack || error?.message || error)
     finishSession('startup-error')
   }
 }
 
 function shutdown(signal) {
-  if (intentionallyStopping) return
+  if (stopping) return
 
-  intentionallyStopping = true
-  log(`Received ${signal}, shutting down gracefully...`)
+  stopping = true
+  log(`Received ${signal}; shutting down...`)
 
-  clearAllTimers()
-  clearSessionState()
-  safeCloseClient('Bot shutting down')
-  process.exit(0)
+  clearReconnect()
+  clearKeepalive()
+  resetSessionState()
+  closeClient('Bot shutting down')
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'))
 process.once('SIGTERM', () => shutdown('SIGTERM'))
 
-process.on('uncaughtException', (err) => {
-  log('Uncaught exception:', err?.stack || err?.message || err)
+process.on('uncaughtException', (error) => {
+  log('Uncaught exception:', error?.stack || error?.message || error)
   finishSession('uncaught-exception')
 })
 
@@ -527,7 +364,7 @@ process.on('unhandledRejection', (reason) => {
   finishSession('unhandled-rejection')
 })
 
-startBot().catch((err) => {
-  log('Fatal startup error:', err?.stack || err?.message || err)
+startBot().catch((error) => {
+  log('Fatal startup error:', error?.stack || error?.message || error)
   finishSession('fatal-startup')
 })
