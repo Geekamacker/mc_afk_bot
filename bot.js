@@ -251,6 +251,38 @@ function handleMsaCode(code) {
 }
 
 function attachClientHandlers(newClient) {
+  // bedrock-protocol emits the generic `packet` event before it applies its
+  // authentication-state filter. This lets us capture a packet-violation
+  // warning that would otherwise be discarded before the named event fires.
+  newClient.on('packet', (deserialized) => {
+    const packetName = deserialized?.data?.name
+    const packetParams = deserialized?.data?.params
+
+    if (packetName === 'packet_violation_warning') {
+      log('PACKET VIOLATION WARNING:', safeJson(packetParams))
+      return
+    }
+
+    // These are useful during the login sequence and do not contain the huge
+    // authentication/skin payload sent by the client.
+    if (packetName === 'disconnect') {
+      log('RAW DISCONNECT PACKET:', safeJson(packetParams))
+    } else if (packetName === 'play_status') {
+      log('RAW PLAY STATUS:', safeJson(packetParams))
+    }
+  })
+
+  newClient.on('status', (status) => {
+    const names = {
+      0: 'Disconnected',
+      1: 'Connecting',
+      2: 'Authenticating',
+      3: 'Initializing',
+      4: 'Initialized'
+    }
+    log(`CLIENT STATUS: ${status} (${names[status] || 'Unknown'})`)
+  })
+
   newClient.on('connect', () => {
     log('RakNet connection established')
   })
