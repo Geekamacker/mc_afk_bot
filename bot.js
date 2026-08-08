@@ -60,12 +60,14 @@ function toJson(value) {
 
 function clearKeepalive() {
   if (!keepaliveTimer) return
+
   clearInterval(keepaliveTimer)
   keepaliveTimer = null
 }
 
 function clearReconnect() {
   if (!reconnectTimer) return
+
   clearTimeout(reconnectTimer)
   reconnectTimer = null
 }
@@ -86,21 +88,23 @@ function closeClient(reason = 'Client closing') {
 
   try {
     oldClient.removeAllListeners()
+
     oldClient.on('error', (error) => {
       log('Ignored late client error:', error?.message || error)
     })
   } catch (_) {}
 
   try {
-    if (oldClient.connection?.connected !== true) return
-
-    if (typeof oldClient.disconnect === 'function') {
+    if (
+      oldClient.connection?.connected === true &&
+      typeof oldClient.disconnect === 'function'
+    ) {
       oldClient.disconnect(reason, true)
     } else if (typeof oldClient.close === 'function') {
       oldClient.close()
     }
   } catch (error) {
-    log('Client close warning:', error.message)
+    log('Client close warning:', error?.message || error)
   }
 }
 
@@ -112,6 +116,7 @@ function scheduleReconnect(reason) {
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
+
     startBot().catch((error) => {
       log('Reconnect failed:', error?.stack || error?.message || error)
       finishSession('reconnect-error')
@@ -185,7 +190,9 @@ function startKeepalive() {
 
 function showMicrosoftCode(code) {
   const userCode = code?.user_code || null
-  const verificationUri = code?.verification_uri || 'https://www.microsoft.com/link'
+  const verificationUri =
+    code?.verification_uri || 'https://www.microsoft.com/link'
+
   let signInUrl = verificationUri
 
   if (userCode) {
@@ -194,17 +201,21 @@ function showMicrosoftCode(code) {
       url.searchParams.set('otc', userCode)
       signInUrl = url.toString()
     } catch (_) {
-      signInUrl = `https://www.microsoft.com/link?otc=${encodeURIComponent(userCode)}`
+      signInUrl =
+        `https://www.microsoft.com/link?otc=${encodeURIComponent(userCode)}`
     }
   }
 
   log('=== MICROSOFT SIGN-IN REQUIRED ===')
   log(`COPY/OPEN THIS LINK: ${signInUrl}`)
 
-  if (userCode) log(`Fallback code: ${userCode}`)
+  if (userCode) {
+    log(`Fallback code: ${userCode}`)
+  }
 
   if (Number.isFinite(code?.expires_in)) {
-    log(`This code expires in about ${Math.ceil(code.expires_in / 60)} minute(s).`)
+    const minutes = Math.ceil(code.expires_in / 60)
+    log(`This code expires in about ${minutes} minute(s).`)
   }
 
   log('Do not restart the bot while sign-in is pending.')
@@ -212,15 +223,16 @@ function showMicrosoftCode(code) {
 }
 
 function attachClientHandlers(newClient) {
-  // This is the one targeted diagnostic worth retaining. bedrock-protocol
-  // exposes the packet here before rejecting it during authentication.
+  // Keep only the targeted malformed-login diagnostic.
   newClient.on('packet', (packet) => {
     if (packet?.data?.name !== 'packet_violation_warning') return
+
     log('PACKET VIOLATION WARNING:', toJson(packet.data.params))
   })
 
   newClient.on('session', (profile) => {
-    log(`Microsoft/Xbox authentication completed as ${profile?.name || 'unknown player'}`)
+    const name = profile?.name || 'unknown player'
+    log(`Microsoft/Xbox authentication completed as ${name}`)
   })
 
   newClient.on('join', () => {
@@ -229,6 +241,7 @@ function attachClientHandlers(newClient) {
     endingSession = false
     reconnectDelay = RECONNECT_INITIAL_MS
     clearReconnect()
+
     log('Joined server')
   })
 
@@ -261,9 +274,10 @@ function attachClientHandlers(newClient) {
   newClient.on('text', (packet) => {
     const source = packet?.source_name || 'server'
     const message = packet?.message || ''
-    const parameters = Array.isArray(packet?.parameters) && packet.parameters.length
-      ? ` | parameters=${toJson(packet.parameters)}`
-      : ''
+    const parameters =
+      Array.isArray(packet?.parameters) && packet.parameters.length
+        ? ` | parameters=${toJson(packet.parameters)}`
+        : ''
 
     log(`[CHAT] ${source}: ${message}${parameters}`)
   })
@@ -278,7 +292,10 @@ function attachClientHandlers(newClient) {
 
   newClient.on('error', (error) => {
     log('Client error:', error?.stack || error?.message || error)
-    if (!connected) finishSession('client-error')
+
+    if (!connected) {
+      finishSession('client-error')
+    }
   })
 
   newClient.on('end', () => {
@@ -328,17 +345,6 @@ async function startBot() {
     client = bedrock.createClient({
       host: HOST,
       port: PORT,
-
-      // Use the available 1.26.40 packet definitions/protocol 2168.
-      version: '1.26.40',
-
-      // Report the actual patch version advertised by the host.
-      // This tests whether the 1.26.40 fallback GameVersion causes
-      // the malformed Connection Request seen with a 1.26.43 host.
-      skinData: {
-        GameVersion: '1.26.43'
-      },
-
       authflow: authFlow,
       connectTimeout: CONNECT_TIMEOUT_MS
     })
@@ -360,6 +366,8 @@ function shutdown(signal) {
   clearKeepalive()
   resetSessionState()
   closeClient('Bot shutting down')
+
+  setTimeout(() => process.exit(0), 250)
 }
 
 process.once('SIGINT', () => shutdown('SIGINT'))
