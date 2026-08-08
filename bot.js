@@ -328,6 +328,17 @@ async function startBot() {
     client = bedrock.createClient({
       host: HOST,
       port: PORT,
+
+      // Use the available 1.26.40 packet definitions/protocol 2168.
+      version: '1.26.40',
+
+      // Report the actual patch version advertised by the host.
+      // This tests whether the 1.26.40 fallback GameVersion causes
+      // the malformed Connection Request seen with a 1.26.43 host.
+      skinData: {
+        GameVersion: '1.26.43'
+      },
+
       authflow: authFlow,
       connectTimeout: CONNECT_TIMEOUT_MS
     })
